@@ -4,18 +4,21 @@ from qgis.PyQt.QtCore import Qt, QThread, pyqtSignal
 from qgis.PyQt.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QLabel, QComboBox,
                                  QPushButton, QLineEdit, QCheckBox, QProgressBar, QMessageBox,
                                  QTableWidget, QTableWidgetItem, QHeaderView, QSplitter, QWidget,
-                                 QRadioButton, QButtonGroup)
+                                 QRadioButton, QButtonGroup, QStyledItemDelegate)
 from qgis.PyQt.QtGui import QValidator
 from qgis.core import (QgsProject, QgsDataSourceUri, QgsVectorLayer, QgsGeometry,
                        QgsCoordinateTransform, QgsFeatureRequest, QgsProviderRegistry,
-                       QgsApplication)
+                       QgsApplication, QgsMessageLog, QgsSettings)
 import processing
 import unicodedata
 import re
-from concurrent.futures import ThreadPoolExecutor, as_completed
+import os
 
-from .compat import (Qt_Horizontal, SelectRows, HeaderStretch, ItemIsEditable,
-                     ValidatorAcceptable, ValidatorInvalid, MsgYes, MsgNo)
+from .compat import (Qt_Horizontal, HeaderStretch, ItemIsEditable,
+                     ValidatorAcceptable, ValidatorInvalid, MsgYes, MsgNo, LogWarning)
+from .utils import get_geometry_type_from_layer
+
+_TAG = "Geo File Scanner"
 
 
 def _get_postgis_alg_id():
@@ -33,14 +36,28 @@ class AlphanumericValidator(QValidator):
         return ValidatorInvalid, string, pos
 
 
+class AlphanumericDelegate(QStyledItemDelegate):
+    """Délégué appliquant AlphanumericValidator aux cellules éditables du tableau."""
+    def createEditor(self, parent, option, index):
+        editor = QLineEdit(parent)
+        editor.setValidator(AlphanumericValidator())
+        return editor
+
+
 class ImportThread(QThread):
-    """Thread pour importer vers PostgreSQL en parallèle"""
+    """Thread pour importer les couches vers PostgreSQL de façon séquentielle.
+
+    Les imports s'effectuent les uns après les autres dans le thread (et non dans
+    des sous-threads Python), ce qui garantit la compatibilité avec QGIS Processing
+    qui n'est pas thread-safe depuis des threads non-Qt.
+    Les fichiers sont traités du plus lourd au plus léger.
+    """
     progress = pyqtSignal(int, int, str)
     finished_signal = pyqtSignal(bool, str, list)
 
     def __init__(self, layers_data, pg_params, prefix, apply_filter, filter_geom, filter_crs, dept_code, region_code):
         super().__init__()
-        self.layers_data = layers_data
+        self.layers_data = layers_data   # Déjà triés par taille décroissante
         self.pg_params = pg_params
         self.prefix = prefix
         self.apply_filter = apply_filter
@@ -49,8 +66,6 @@ class ImportThread(QThread):
         self.dept_code = dept_code
         self.region_code = region_code
         self.is_canceled = False
-        self.completed = 0
-        self.total = len(layers_data)
         self._alg_id = _get_postgis_alg_id()
 
     def cancel(self):
@@ -58,33 +73,29 @@ class ImportThread(QThread):
 
     def run(self):
         failed = []
+        total = len(self.layers_data)
 
-        with ThreadPoolExecutor(max_workers=4) as executor:
-            futures = {executor.submit(self._import_layer, layer_info): layer_info for layer_info in self.layers_data}
+        for i, layer_info in enumerate(self.layers_data):
+            if self.is_canceled:
+                self.finished_signal.emit(False, "Import annulé", [])
+                return
 
-            for future in as_completed(futures):
-                if self.is_canceled:
-                    self.finished_signal.emit(False, "Import annulé", [])
-                    return
+            success, error_msg = self._import_layer(layer_info)
+            if not success:
+                failed.append(f"{layer_info['display_name']}: {error_msg}")
+                QgsMessageLog.logMessage(
+                    f"Échec import '{layer_info['display_name']}': {error_msg}", _TAG, LogWarning
+                )
 
-                layer_info = futures[future]
-                try:
-                    success, error_msg = future.result()
-                    if not success:
-                        failed.append(f"{layer_info['display_name']}: {error_msg}")
-                except Exception as e:
-                    failed.append(f"{layer_info['display_name']}: {str(e)}")
-
-                self.completed += 1
-                self.progress.emit(self.completed, self.total, f"Importé {self.completed}/{self.total}")
+            self.progress.emit(i + 1, total, f"Importé {i + 1}/{total}")
 
         if failed:
             msg = f"Échec de {len(failed)} import(s):\n" + "\n".join(failed[:5])
             if len(failed) > 5:
-                msg += f"\n... et {len(failed)-5} autres"
+                msg += f"\n... et {len(failed) - 5} autres"
             self.finished_signal.emit(False, msg, failed)
         else:
-            self.finished_signal.emit(True, f"{self.total} couche(s) importée(s) avec succès", [])
+            self.finished_signal.emit(True, f"{total} couche(s) importée(s) avec succès", [])
 
     def _import_layer(self, layer_info):
         """Importe une couche vers PostgreSQL. Retourne (succès, message_erreur)."""
@@ -143,31 +154,25 @@ class ImportThread(QThread):
         for feat in layer.getFeatures():
             if feat.hasGeometry() and feat.geometry().intersects(filter_geom_transformed):
                 return True
-
         return False
 
     def _apply_spatial_filter(self, layer):
-        """Applique un filtre spatial sur la couche"""
+        """Applique un filtre spatial sur la couche (buffer 100 m)"""
         transform = QgsCoordinateTransform(self.filter_crs, layer.crs(), QgsProject.instance())
         filter_geom_transformed = QgsGeometry(self.filter_geom)
         filter_geom_transformed.transform(transform)
-
         buffer_geom = filter_geom_transformed.buffer(100, 5)
 
         request = QgsFeatureRequest().setFilterRect(buffer_geom.boundingBox())
         features = [f for f in layer.getFeatures(request) if f.geometry().intersects(buffer_geom)]
 
-        geom_map = {
-            'Point': 'Point', 'LineString': 'LineString', 'Polygon': 'Polygon'
-        }
-        from .utils import get_geometry_type_from_layer
+        geom_map = {'Point': 'Point', 'LineString': 'LineString', 'Polygon': 'Polygon'}
         geom_type = geom_map.get(get_geometry_type_from_layer(layer), 'Point')
 
         filtered_layer = QgsVectorLayer(f"{geom_type}?crs={layer.crs().authid()}", "filtered", "memory")
         filtered_layer.dataProvider().addAttributes(layer.fields())
         filtered_layer.updateFields()
         filtered_layer.dataProvider().addFeatures(features)
-
         return filtered_layer
 
 
@@ -177,8 +182,7 @@ def normalize_table_name(name):
     name = name.lower()
     name = re.sub(r'[^a-z0-9_]', '_', name)
     name = re.sub(r'_+', '_', name)
-    name = name.strip('_')
-    return name
+    return name.strip('_')
 
 
 class PostgresImportDialog(QDialog):
@@ -198,30 +202,29 @@ class PostgresImportDialog(QDialog):
 
     def setup_ui(self):
         main_layout = QHBoxLayout()
-
         splitter = QSplitter(Qt_Horizontal)
 
         # PARTIE GAUCHE : Tableau des couches
         left_widget = QWidget()
         left_layout = QVBoxLayout(left_widget)
         left_layout.addWidget(QLabel(f"<b>{len(self.selected_files)} couche(s) sélectionnée(s)</b>"))
+        left_layout.addWidget(QLabel("Double-cliquez sur « Nom de table » pour le modifier "
+                                     "(caractères alphanumériques et _ uniquement)."))
 
         self.layers_table = QTableWidget()
         self.layers_table.setColumnCount(2)
         self.layers_table.setHorizontalHeaderLabels(['Nom original', 'Nom de table'])
         self.layers_table.setRowCount(len(self.selected_files))
+        self.layers_table.setItemDelegateForColumn(1, AlphanumericDelegate(self.layers_table))
 
         for row, f in enumerate(self.selected_files):
             name_item = QTableWidgetItem(f['name'])
             name_item.setFlags(name_item.flags() & ~ItemIsEditable)
             self.layers_table.setItem(row, 0, name_item)
-
-            table_item = QTableWidgetItem(f['name'])
-            self.layers_table.setItem(row, 1, table_item)
+            self.layers_table.setItem(row, 1, QTableWidgetItem(f['name']))
 
         self.layers_table.horizontalHeader().setSectionResizeMode(0, HeaderStretch)
         self.layers_table.horizontalHeader().setSectionResizeMode(1, HeaderStretch)
-
         left_layout.addWidget(self.layers_table)
 
         # PARTIE DROITE : Paramètres
@@ -240,7 +243,6 @@ class PostgresImportDialog(QDialog):
 
         # Schéma
         right_layout.addWidget(QLabel("Schéma:"))
-
         self.schema_group = QButtonGroup()
         self.schema_existing_radio = QRadioButton("Schéma existant")
         self.schema_new_radio = QRadioButton("Nouveau schéma")
@@ -248,15 +250,14 @@ class PostgresImportDialog(QDialog):
         self.schema_group.addButton(self.schema_new_radio)
         self.schema_existing_radio.setChecked(True)
         self.schema_existing_radio.toggled.connect(self._on_schema_type_changed)
-
         right_layout.addWidget(self.schema_existing_radio)
         right_layout.addWidget(self.schema_new_radio)
 
         self.schema_combo = QComboBox()
         self.schema_edit = QLineEdit()
         self.schema_edit.setPlaceholderText("Nom du nouveau schéma")
+        self.schema_edit.setValidator(AlphanumericValidator())
         self.schema_edit.setVisible(False)
-
         right_layout.addWidget(self.schema_combo)
         right_layout.addWidget(self.schema_edit)
 
@@ -316,13 +317,11 @@ class PostgresImportDialog(QDialog):
         splitter.addWidget(left_widget)
         splitter.addWidget(right_widget)
         splitter.setSizes([400, 500])
-
         main_layout.addWidget(splitter)
         self.setLayout(main_layout)
 
     def _load_pg_connections(self):
-        """Charge les connexions PostgreSQL"""
-        from qgis.core import QgsSettings
+        """Charge les connexions PostgreSQL depuis les paramètres QGIS"""
         settings = QgsSettings()
         settings.beginGroup("PostgreSQL/connections")
         connections = settings.childGroups()
@@ -358,15 +357,13 @@ class PostgresImportDialog(QDialog):
         self.schema_edit.setVisible(not is_existing)
 
     def _get_schemas(self, pg_params):
-        """Récupère la liste des schémas"""
+        """Récupère la liste des schémas depuis la base"""
         try:
             uri = QgsDataSourceUri()
             uri.setConnection(pg_params['host'], pg_params['port'], pg_params['database'],
                               pg_params['username'], pg_params['password'])
-
             metadata = QgsProviderRegistry.instance().providerMetadata('postgres')
             conn = metadata.createConnection(uri.uri(), {})
-
             return [s for s in conn.schemas() if s not in ['information_schema', 'pg_catalog']]
         except Exception:
             return ['public']
@@ -375,20 +372,17 @@ class PostgresImportDialog(QDialog):
         """Charge les régions"""
         if not self.region_layer or not self.region_layer.isValid():
             return
-
         regions = []
         for feat in self.region_layer.getFeatures():
-            nom = feat['nom']
-            code = feat['code']
+            nom, code = feat['nom'], feat['code']
             if nom and code:
                 regions.append((f"{nom} ({code})", code))
-
         regions.sort()
         for nom, code in regions:
             self.region_combo.addItem(nom, code)
 
     def _on_region_changed(self):
-        """Met à jour les départements"""
+        """Met à jour la liste des départements selon la région sélectionnée"""
         self.dept_combo.clear()
         self.dept_combo.addItem("(Aucun)", None)
 
@@ -399,36 +393,27 @@ class PostgresImportDialog(QDialog):
         depts = []
         for feat in self.departement_layer.getFeatures():
             if feat['code_reg'] == region_code:
-                nom = feat['nom']
-                code = feat['code']
+                nom, code = feat['nom'], feat['code']
                 if nom and code:
                     depts.append((f"{nom} ({code})", code, feat.geometry()))
-
         depts.sort()
         for nom, code, geom in depts:
             self.dept_combo.addItem(nom, {'code': code, 'geom': geom})
 
     def start_import(self):
-        """Démarre l'import"""
+        """Valide les paramètres et lance l'import"""
         if self.conn_combo.count() == 0:
             QMessageBox.warning(self, "Erreur", "Aucune connexion PostgreSQL configurée")
             return
 
-        table_names = {}
+        # Vérification des doublons de noms de tables
+        seen = {}
         for row in range(self.layers_table.rowCount()):
             name = self.layers_table.item(row, 1).text().strip()
-            if name in table_names:
-                QMessageBox.warning(self, "Erreur", f"Nom de table en double: '{name}'")
+            if name in seen:
+                QMessageBox.warning(self, "Erreur", f"Nom de table en double : '{name}'")
                 return
-            table_names[name] = True
-
-        if self.schema_existing_radio.isChecked():
-            schema = self.schema_combo.currentText()
-        else:
-            schema = self.schema_edit.text().strip()
-            if not schema:
-                QMessageBox.warning(self, "Erreur", "Veuillez saisir un nom de schéma")
-                return
+            seen[name] = True
 
         conn_name = self.conn_combo.currentData()
         pg_params = self._get_pg_params(conn_name)
@@ -436,54 +421,58 @@ class PostgresImportDialog(QDialog):
             QMessageBox.warning(self, "Erreur", "Impossible de lire les paramètres de connexion")
             return
 
+        # Récupération et création éventuelle du schéma
+        if self.schema_existing_radio.isChecked():
+            schema = self.schema_combo.currentText()
+        else:
+            schema = self.schema_edit.text().strip()
+            if not schema:
+                QMessageBox.warning(self, "Erreur", "Veuillez saisir un nom de schéma")
+                return
+            if not self._create_schema(pg_params, schema):
+                return
+
         pg_params['schema'] = schema
         pg_params['conn_name'] = conn_name
 
+        # Confirmation si tables existantes vont être écrasées
         if self.schema_existing_radio.isChecked():
             existing_tables = self._get_existing_tables(pg_params)
-            tables_to_overwrite = []
-
             dept_data = self.dept_combo.currentData()
             region_code = self.region_combo.currentData()
             prefix = self.prefix_edit.text().strip()
 
+            tables_to_overwrite = []
             for row in range(self.layers_table.rowCount()):
-                custom_name = self.layers_table.item(row, 1).text().strip()
-                normalized = normalize_table_name(custom_name)
-
+                normalized = normalize_table_name(self.layers_table.item(row, 1).text().strip())
                 if dept_data:
                     normalized = f"d{dept_data['code']}_{normalized}"
                 elif region_code:
                     normalized = f"r{region_code}_{normalized}"
-
                 if prefix:
                     normalized = f"{prefix}_{normalized}"
-
                 if normalized in existing_tables:
                     tables_to_overwrite.append(normalized)
 
             if tables_to_overwrite:
-                msg = "Les tables suivantes seront écrasées:\n" + "\n".join(tables_to_overwrite[:10])
+                msg = "Les tables suivantes seront écrasées :\n" + "\n".join(tables_to_overwrite[:10])
                 if len(tables_to_overwrite) > 10:
-                    msg += f"\n... et {len(tables_to_overwrite)-10} autres"
-                msg += "\n\nContinuer?"
-
-                reply = QMessageBox.question(self, "Confirmation", msg, MsgYes | MsgNo)
-                if reply == MsgNo:
+                    msg += f"\n... et {len(tables_to_overwrite) - 10} autres"
+                msg += "\n\nContinuer ?"
+                if QMessageBox.question(self, "Confirmation", msg, MsgYes | MsgNo) == MsgNo:
                     return
 
+        # Préparation des données, triées du plus gros fichier au plus petit
         dept_data = self.dept_combo.currentData()
         region_code = self.region_combo.currentData()
+        dept_code = dept_data['code'] if dept_data else None
 
         filter_geom = None
         filter_crs = None
-        dept_code = None
-
         if self.filter_check.isChecked():
             if dept_data:
                 filter_geom = dept_data['geom']
                 filter_crs = self.departement_layer.crs()
-                dept_code = dept_data['code']
             elif region_code:
                 for feat in self.region_layer.getFeatures():
                     if feat['code'] == region_code:
@@ -491,32 +480,54 @@ class PostgresImportDialog(QDialog):
                         filter_crs = self.region_layer.crs()
                         break
 
-        if dept_data:
-            dept_code = dept_data['code']
-
         layers_data = []
         for row, file_info in enumerate(self.selected_files):
             custom_name = self.layers_table.item(row, 1).text().strip()
+            try:
+                file_size = os.path.getsize(file_info['path'])
+            except OSError:
+                file_size = 0
             layers_data.append({
                 'display_name': file_info['name'],
                 'custom_name': custom_name,
-                'uri': file_info['uri']
+                'uri': file_info['uri'],
+                'file_size': file_size,
             })
 
+        layers_data.sort(key=lambda x: x['file_size'], reverse=True)
+
         self.import_button.setEnabled(False)
+        self.progress_bar.setRange(0, len(layers_data))
+        self.progress_bar.setValue(0)
         self.progress_bar.setVisible(True)
         self.progress_label.setVisible(True)
 
-        self.import_thread = ImportThread(layers_data, pg_params, self.prefix_edit.text().strip(),
-                                          self.filter_check.isChecked(), filter_geom, filter_crs,
-                                          dept_code, region_code)
+        self.import_thread = ImportThread(
+            layers_data, pg_params, self.prefix_edit.text().strip(),
+            self.filter_check.isChecked(), filter_geom, filter_crs,
+            dept_code, region_code
+        )
         self.import_thread.progress.connect(self.update_progress)
         self.import_thread.finished_signal.connect(self.import_finished)
         self.import_thread.start()
 
+    def _create_schema(self, pg_params, schema_name):
+        """Crée le schéma dans la base. Retourne True si succès, False sinon."""
+        try:
+            uri = QgsDataSourceUri()
+            uri.setConnection(pg_params['host'], pg_params['port'], pg_params['database'],
+                              pg_params['username'], pg_params['password'])
+            metadata = QgsProviderRegistry.instance().providerMetadata('postgres')
+            conn = metadata.createConnection(uri.uri(), {})
+            conn.createSchema(schema_name)
+            return True
+        except Exception as e:
+            QMessageBox.warning(self, "Erreur",
+                                f"Impossible de créer le schéma '{schema_name}' :\n{e}")
+            return False
+
     def update_progress(self, current, total, message):
-        if total > 0:
-            self.progress_bar.setValue(int(current * 100 / total))
+        self.progress_bar.setValue(current)
         self.progress_label.setText(message)
 
     def import_finished(self, success, message, failed):
@@ -536,20 +547,16 @@ class PostgresImportDialog(QDialog):
             uri = QgsDataSourceUri()
             uri.setConnection(pg_params['host'], pg_params['port'], pg_params['database'],
                               pg_params['username'], pg_params['password'])
-
             metadata = QgsProviderRegistry.instance().providerMetadata('postgres')
             conn = metadata.createConnection(uri.uri(), {})
-
             return [t.tableName() for t in conn.tables(pg_params['schema'])]
         except Exception:
             return []
 
     def _get_pg_params(self, conn_name):
-        """Récupère les paramètres de connexion"""
-        from qgis.core import QgsSettings
+        """Récupère les paramètres de connexion depuis les paramètres QGIS"""
         settings = QgsSettings()
         settings.beginGroup(f"PostgreSQL/connections/{conn_name}")
-
         params = {
             'host': settings.value('host', ''),
             'port': settings.value('port', '5432'),
@@ -557,7 +564,5 @@ class PostgresImportDialog(QDialog):
             'username': settings.value('username', ''),
             'password': settings.value('password', '')
         }
-
         settings.endGroup()
-
         return params if params['host'] and params['database'] else None

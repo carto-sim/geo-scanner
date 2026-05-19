@@ -7,11 +7,7 @@ version=1.0.0
 author=Votre Nom
 email=votre.email@example.com
 
-about=Ce plugin scanne récursivement un dossier pour identifier tous les fichiers
- géographiques (shapefile, GeoJSON, GeoPackage, KML, rasters, etc.) et affiche une
- liste détaillée avec les chemins, tailles, systèmes de coordonnées et la couverture
- géographique (départements et régions françaises). Il permet également d'importer les
- couches sélectionnées dans une base de données PostgreSQL/PostGIS.
+about=Ce plugin scanne récursivement un dossier pour identifier tous les fichiers géographiques (shapefile, GeoJSON, GeoPackage, KML, etc.) et affiche une liste détaillée avec chemins, tailles, systèmes de coordonnées et couverture géographique (départements et régions françaises). Il permet également d'importer les couches sélectionnées dans une base de données PostgreSQL/PostGIS.
 
 tracker=https://github.com/carto-sim/geo-scanner/issues
 repository=https://github.com/carto-sim/geo-scanner

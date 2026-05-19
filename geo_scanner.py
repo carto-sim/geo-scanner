@@ -11,7 +11,7 @@ import os
 from .scan_thread import ScanThread
 from .analysis import GeographicAnalyzer
 from .compat import SelectRows, MultiSelection, ResizeToContents, HeaderStretch
-from .utils import (get_short_path, is_valid_geo_layer, format_size,
+from .utils import (compute_short_paths, is_valid_geo_layer, format_size,
                     get_epsg_from_layer, get_geometry_type_from_layer, get_feature_count_from_layer)
 
 
@@ -194,13 +194,8 @@ class GeoFileScannerPlugin:
 
         from .postgres_export import PostgresImportDialog
 
-        selected_files = []
-        for row in sorted(selected_rows):
-            name = self.table.item(row, 0).text()
-            for f in self.current_geo_files:
-                if f['name'] == name:
-                    selected_files.append(f)
-                    break
+        # Les lignes du tableau correspondent directement aux indices de current_geo_files
+        selected_files = [self.current_geo_files[row] for row in sorted(selected_rows)]
 
         dialog = PostgresImportDialog(self.dialog, selected_files,
                                       self.analyzer.departement_layer,
@@ -242,26 +237,18 @@ class GeoFileScannerPlugin:
                 geo_files.extend(self._process_file(file_path, file, file_ext, folder_path, thread, current, total))
 
         self.current_geo_files = geo_files
-
-        for f in geo_files:
-            f['temp_short_path'] = get_short_path(f['path'], folder_path, geo_files)
-        for f in geo_files:
-            f['short_path'] = get_short_path(f['path'], folder_path, geo_files)
-
+        compute_short_paths(geo_files, folder_path)
         return geo_files
 
     def _process_file(self, file_path, file, file_ext, folder_path, thread, current, total):
         """Traite un fichier géographique"""
-        results = []
-
         if file_ext in self.MULTI_LAYER_FORMATS:
-            results = self._process_multi_layer(file_path, file, file_ext, folder_path, thread, current, total)
-        else:
-            layer = QgsVectorLayer(file_path, "temp", "ogr")
-            if is_valid_geo_layer(layer):
-                results.append(self._create_entry(file_path, file, file_ext, folder_path, Path(file).stem, layer, file_path))
+            return self._process_multi_layer(file_path, file, file_ext, folder_path, thread, current, total)
 
-        return results
+        layer = QgsVectorLayer(file_path, "temp", "ogr")
+        if is_valid_geo_layer(layer):
+            return [self._create_entry(file_path, file, file_ext, folder_path, Path(file).stem, layer, file_path)]
+        return []
 
     def _process_multi_layer(self, file_path, file, file_ext, folder_path, thread, current, total):
         """Traite un fichier multi-couches"""
@@ -306,7 +293,6 @@ class GeoFileScannerPlugin:
             'uri': uri,
             'relative_path': os.path.relpath(file_path, folder_path),
             'short_path': None,
-            'temp_short_path': None,
             'name': name,
             'extension': file_ext,
             'size': format_size(os.path.getsize(file_path)),

@@ -2,6 +2,7 @@
 from qgis.PyQt.QtCore import Qt
 from qgis.PyQt.QtWidgets import QAbstractItemView, QHeaderView, QMessageBox
 from qgis.PyQt.QtGui import QValidator
+from qgis.core import QgsFeatureRequest, Qgis as _Qgis
 
 
 def _attr(obj, *names):
@@ -39,9 +40,16 @@ ItemIsEditable = _attr(Qt, 'ItemIsEditable', 'ItemFlag.ItemIsEditable')
 MsgYes = _attr(QMessageBox, 'Yes', 'StandardButton.Yes')
 MsgNo = _attr(QMessageBox, 'No', 'StandardButton.No')
 
+# QgsFeatureRequest: no-geometry flag for lightweight ID-only queries
+NoGeometryFlag = _attr(QgsFeatureRequest, 'NoGeometry', 'Flag.NoGeometry')
+
+# QGIS message log levels  (Qgis.Warning  →  Qgis.MessageLevel.Warning in QGIS 4)
+LogInfo = _attr(_Qgis, 'Info', 'MessageLevel.Info')
+LogWarning = _attr(_Qgis, 'Warning', 'MessageLevel.Warning')
+LogCritical = _attr(_Qgis, 'Critical', 'MessageLevel.Critical')
+
 # QGIS geometry types  (Qgis.GeometryType since 3.26 / QgsWkbTypes before)
 try:
-    from qgis.core import Qgis as _Qgis
     GeomPoint = _Qgis.GeometryType.Point
     GeomLine = _Qgis.GeometryType.Line
     GeomPolygon = _Qgis.GeometryType.Polygon
