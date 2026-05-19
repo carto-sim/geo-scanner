@@ -1,0 +1,174 @@
+# Prompt pour créer un plugin QGIS de scan et import de fichiers géographiques
+
+Je souhaite créer un plugin QGIS complet avec les fonctionnalités suivantes :
+
+## Architecture du plugin
+
+Le plugin doit être organisé en plusieurs fichiers Python modulaires :
+- `__init__.py` : Point d'entrée
+- `geo_scanner.py` : Fichier principal
+- `scan_thread.py` : Thread pour scanner les fichiers en arrière-plan
+- `analysis.py` : Analyse géographique (départements/régions)
+- `utils.py` : Fonctions utilitaires
+- `postgres_export.py` : Import vers PostgreSQL
+- `metadata.txt` : Métadonnées du plugin
+
+## Fonctionnalité 1 : Scan de fichiers géographiques
+
+### Interface principale
+- Bouton dans la barre d'outils QGIS "Scanner fichiers géographiques"
+- Dialogue de sélection de dossier
+- Fenêtre de résultats non-modale (QGIS reste utilisable)
+
+### Scan avec barre de progression
+- Scanner récursivement un dossier pour trouver tous les fichiers géographiques
+- Formats supportés : .shp, .geojson, .json, .gpkg, .gml, .kml, .gpx, .tab, .mif, .dxf, .gdb, .sqlite
+- Formats multi-couches (.gpkg, .kml, .sqlite) : détecter et lister chaque couche séparément
+- Ignorer les fichiers/couches sans géométrie valide
+- Barre de progression en temps réel avec nom du fichier en cours
+- Bouton "Annuler" fonctionnel pour interrompre le scan
+- Afficher le temps total d'analyse
+- Limiter à 100 fichiers maximum (sinon afficher message d'erreur)
+
+### Tableau de résultats (9 colonnes)
+1. **Nom** : nom du fichier sans extension, ou "fichier [nom_couche]" pour multi-couches
+2. **Dossier** : chemin court intelligent avec gestion des doublons (voir règles ci-dessous)
+3. **Type** : extension du fichier
+4. **Géométrie** : Point, LineString ou Polygon
+5. **Nb entités** : nombre total d'entités
+6. **Taille** : taille formatée (Ko, Mo, Go)
+7. **EPSG** : code du système de coordonnées
+8. **Département** : département français (voir règles ci-dessous)
+9. **Région** : région française (voir règles ci-dessous)
+
+Le tableau doit :
+- Permettre le tri par colonne
+- Permettre la sélection multiple de lignes
+- Afficher les infobulles : chemin relatif complet sur colonne "Dossier"
+
+### Règles pour la colonne "Dossier"
+
+**Pour les fichiers uniques** (pas de doublon de nom) :
+- Afficher uniquement le répertoire racine (ex: "data")
+
+**Pour les fichiers avec même nom** (doublons détectés) :
+- Calculer la partie discriminante du chemin en enlevant :
+  - Le préfixe commun à tous les doublons
+  - Le suffixe commun à tous les doublons
+- Exemple : `A/B/C/D/fichier.shp` et `A/R/S/D/fichier.shp` → afficher "B/C" et "R/S"
+
+**Si >50% des fichiers ont le même dossier racine** :
+- Ajouter un niveau de sous-répertoire pour distinguer
+- Exemple : si beaucoup dans "data/", afficher "data/sous_dossier" ou "data (racine)"
+
+### Règles pour Département et Région
+
+**Prérequis** :
+- Deux shapefiles de référence dans `data/DEPARTEMENT.shp` et `data/REGION.shp`
+- Champs obligatoires : `nom`, `code`, `code_reg` (pour département)
+
+**Analyse de couverture géographique** :
+- Pour chaque fichier, analyser l'intersection avec départements/régions
+- Si >500 entités : échantillon aléatoire de 500 pour optimisation
+- Transformer les coordonnées si nécessaire (gérer les différents CRS)
+
+**Règles d'affichage** :
+- Si ≥90% des entités dans un seul département/région : afficher "Nom (code)" en **gras** avec infobulle pourcentage
+- Si 10-90% : afficher les 2 départements/régions les plus représentés en format "A / B"
+  - Si TOUS <50% : afficher en *italique*
+  - Infobulle avec pourcentages détaillés
+- Si <10% : cellule vide, pas d'infobulle
+- Si plusieurs départements/régions ≥90% : afficher "Plusieurs départements/régions"
+
+## Fonctionnalité 2 : Import vers PostgreSQL
+
+### Bouton "Import des données sur base PostgreSQL"
+- Actif uniquement si au moins une ligne sélectionnée
+- Ouvre un dialogue non-modal
+
+### Interface du dialogue d'import
+
+**Partie gauche** : Tableau des couches sélectionnées
+- Colonne 1 "Nom original" (lecture seule)
+- Colonne 2 "Nom de table" (éditable, validation alphanumérique + underscore)
+- Valeur par défaut : copie du nom original
+
+**Partie droite** : Paramètres d'import
+
+1. **Connexion PostgreSQL** : liste déroulante des connexions configurées dans QGIS
+2. **Schéma** :
+   - Radio bouton "Schéma existant" : liste déroulante des schémas
+   - Radio bouton "Nouveau schéma" : champ texte
+3. **Région** : liste déroulante avec "(Aucune)" + toutes les régions du shapefile REGION
+4. **Département** : liste déroulante filtrée selon la région (via `code_reg`), avec "(Aucun)"
+5. **Préfixe groupement données** : champ texte optionnel (validation alphanumérique + underscore)
+6. **Case à cocher** "Filtrer les entités (intersection avec buffer 100m)"
+7. **Barre de progression** (masquée au départ)
+8. **Boutons** "Importer" et "Annuler"
+
+### Validations avant import
+
+1. **Vérifier doublons de noms** dans le tableau → message d'erreur
+2. **Si schéma existant** : vérifier tables qui seront écrasées → demander confirmation
+3. **Si filtre activé + région/département sélectionné** : vérifier que chaque couche contient au moins une entité intersectant la zone → annuler sinon
+4. **Normalisation des noms de tables** :
+   - Enlever tous les accents
+   - Convertir en minuscules
+   - Remplacer caractères non-alphanumériques par underscore
+   - Supprimer underscores multiples et début/fin
+
+### Construction du nom final de table
+
+Format : `[préfixe_région/dept]_[préfixe_groupement]_[nom_normalisé]`
+
+Exemples :
+- Département 49 sélectionné, préfixe "projet" : `d49_projet_ma_table`
+- Région 52 sélectionnée, pas de préfixe : `r52_ma_table`
+- Pas de région/dept, préfixe "test" : `test_ma_table`
+
+### Import parallélisé
+
+- Lancer tous les imports en parallèle (max 4 threads)
+- Utiliser `processing.run("qgis:importintopostgis", {...})`
+- Barre de progression qui avance à chaque import terminé
+- Si filtre spatial activé : appliquer buffer 100m et filtrer entités
+- À la fin : message succès si tous OK, ou liste des échecs
+
+### Comportement
+- Fenêtre QGIS principale toujours disponible pendant l'import
+- Possibilité d'annuler l'import en cours
+
+## Fonctionnalités techniques importantes
+
+### Thread-safety
+- Scan dans un QThread séparé
+- Import dans ThreadPoolExecutor (4 workers max)
+- Signaux Qt pour communication thread → UI
+
+### Gestion des formats multi-couches
+- Utiliser `QgsProviderRegistry.instance().providerMetadata('ogr').querySublayers()`
+- Créer une entrée par couche avec nom `fichier [couche]`
+- Stocker l'URI de chaque couche pour l'import
+
+### Optimisations
+- Échantillonnage à 500 entités pour analyse géographique si >500
+- Import parallèle (4 threads)
+- Pas de localStorage/sessionStorage
+
+### Validateurs Qt
+- Créer un `AlphanumericValidator` pour limiter la saisie aux caractères alphanumériques + underscore
+
+## Structure des fichiers à créer
+
+Fournis-moi le code complet de chaque fichier en respectant ces spécifications. Le code doit être optimisé, sans duplication, et bien commenté.
+
+**Fichiers attendus** :
+1. `__init__.py`
+2. `scan_thread.py`
+3. `utils.py`
+4. `analysis.py`
+5. `geo_scanner.py`
+6. `postgres_export.py`
+7. `metadata.txt`
+
+Organise le code de manière modulaire et maintenable.

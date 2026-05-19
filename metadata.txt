@@ -1,0 +1,19 @@
+[general]
+name=Geo File Scanner
+qgisMinimumVersion=3.0
+description=Scanne un dossier et liste tous les fichiers géographiques
+version=1.0
+author=Votre Nom
+email=votre.email@example.com
+
+about=Ce plugin scanne récursivement un dossier pour identifier tous les fichiers géographiques (shapefile, GeoJSON, GeoPackage, KML, rasters, etc.) et affiche une liste détaillée avec les chemins et tailles.
+
+tracker=https://github.com/carto-sim/geo-scanner/issues
+repository=https://github.com/carto-sim/geo-scanner
+category=Vector
+icon=icon.png
+experimental=False
+deprecated=False
+
+tags=scanner, fichiers, géographique, analyse, dossier
+homepage=https://github.com/carto-sim/geo-scanner
