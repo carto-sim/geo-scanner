@@ -222,6 +222,9 @@ class GeoFileScannerPlugin:
 
         for root, _, files in os.walk(folder_path):
             for file in files:
+                if len(geo_files) > 100:
+                    return geo_files
+
                 if thread and thread.is_canceled:
                     return geo_files
 
@@ -235,9 +238,6 @@ class GeoFileScannerPlugin:
 
                 file_path = os.path.join(root, file)
                 geo_files.extend(self._process_file(file_path, file, file_ext, folder_path, thread, current, total))
-
-                if len(geo_files) > 100:
-                    return geo_files
 
         self.current_geo_files = geo_files
         compute_short_paths(geo_files, folder_path)
