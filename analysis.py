@@ -37,7 +37,7 @@ class GeographicAnalyzer:
             if feature_count == 0:
                 return result
 
-            if feature_count > 10000:
+            if feature_count > 500:
                 # Collecte les IDs sans charger géométrie ni attributs
                 id_request = QgsFeatureRequest().setNoAttributes().setFlags(NoGeometryFlag)
                 all_ids = [f.id() for f in layer.getFeatures(id_request)]
