@@ -107,7 +107,10 @@ class GeoFileScannerPlugin:
 
     def update_progress(self, current, total, message):
         if total > 0:
+            self.progress_bar.setRange(0, 100)
             self.progress_bar.setValue(int(current * 100 / total))
+        else:
+            self.progress_bar.setRange(0, 0)  # mode indéterminé pendant le comptage
         self.progress_label.setText(message)
 
     def cancel_scan(self):
@@ -214,17 +217,28 @@ class GeoFileScannerPlugin:
         return font if (font.bold() or font.italic()) else None
 
     def scan_folder(self, folder_path, thread=None):
-        """Scanne le dossier"""
+        """Scanne le dossier en deux phases : comptage rapide, puis analyse si ≤ 100 couches."""
+
+        # Phase 1 : comptage sans analyse géographique
+        if thread:
+            thread.progress.emit(0, 0, "Comptage des couches en cours...")
+
+        layer_count = self._count_layers(folder_path, thread)
+
+        if thread and thread.is_canceled:
+            return []
+
+        # Si > 100, on retourne une liste de taille > 100 pour déclencher
+        # le message d'erreur dans scan_finished sans avoir fait d'analyse
+        if layer_count > 100:
+            return [{}] * layer_count
+
+        # Phase 2 : analyse complète (layer_count ≤ 100)
         geo_files = []
-        total = sum(1 for _, _, files in os.walk(folder_path)
-                    for f in files if Path(f).suffix.lower() in self.GEO_EXTENSIONS)
         current = 0
 
         for root, _, files in os.walk(folder_path):
             for file in files:
-                if len(geo_files) > 100:
-                    return geo_files
-
                 if thread and thread.is_canceled:
                     return geo_files
 
@@ -234,14 +248,51 @@ class GeoFileScannerPlugin:
 
                 current += 1
                 if thread:
-                    thread.progress.emit(current, total, f"Analyse : {file}\n({current}/{total})")
+                    thread.progress.emit(current, layer_count,
+                                         f"Analyse : {file}\n({current}/{layer_count})")
 
                 file_path = os.path.join(root, file)
-                geo_files.extend(self._process_file(file_path, file, file_ext, folder_path, thread, current, total))
+                geo_files.extend(self._process_file(file_path, file, file_ext, folder_path,
+                                                     thread, current, layer_count))
 
         self.current_geo_files = geo_files
         compute_short_paths(geo_files, folder_path)
         return geo_files
+
+    def _count_layers(self, folder_path, thread=None):
+        """Compte toutes les couches valides sans faire d'analyse géographique."""
+        count = 0
+        for root, _, files in os.walk(folder_path):
+            for file in files:
+                if thread and thread.is_canceled:
+                    return count
+                file_ext = Path(file).suffix.lower()
+                if file_ext not in self.GEO_EXTENSIONS:
+                    continue
+                file_path = os.path.join(root, file)
+                if file_ext in self.MULTI_LAYER_FORMATS:
+                    count += self._count_sublayers(file_path)
+                else:
+                    layer = QgsVectorLayer(file_path, "temp", "ogr")
+                    if is_valid_geo_layer(layer):
+                        count += 1
+        return count
+
+    def _count_sublayers(self, file_path):
+        """Compte les sous-couches valides d'un fichier multi-couches."""
+        layer = QgsVectorLayer(file_path, "temp", "ogr")
+        if not layer.isValid():
+            return 0
+        metadata = QgsProviderRegistry.instance().providerMetadata('ogr')
+        if not metadata:
+            return 0
+        sublayers = metadata.querySublayers(file_path)
+        if sublayers and len(sublayers) > 1:
+            return sum(
+                1 for s in sublayers
+                if is_valid_geo_layer(QgsVectorLayer(s.uri(), "test", "ogr"))
+            )
+        return 1 if is_valid_geo_layer(layer) else 0
 
     def _process_file(self, file_path, file, file_ext, folder_path, thread, current, total):
         """Traite un fichier géographique"""
