@@ -107,10 +107,7 @@ class GeoFileScannerPlugin:
 
     def update_progress(self, current, total, message):
         if total > 0:
-            self.progress_bar.setRange(0, 100)
             self.progress_bar.setValue(int(current * 100 / total))
-        else:
-            self.progress_bar.setRange(0, 0)  # mode indéterminé pendant le comptage
         self.progress_label.setText(message)
 
     def cancel_scan(self):
@@ -125,8 +122,10 @@ class GeoFileScannerPlugin:
         self.cancel_button.setVisible(False)
 
         if len(geo_files) > 100:
-            self.info_label.setText(f"Le dossier contient {len(geo_files)} fichiers.\n"
-                                    f"Trop important (limite: 100).\nTemps: {elapsed_time:.2f}s")
+            self.info_label.setText(f"Dossier : {self.scan_thread.folder_path}\n"
+                                    f"{len(geo_files)} couches trouvées — limite de 100 atteinte.\n"
+                                    f"Veuillez sélectionner un sous-dossier.")
+            self.change_folder_button.setVisible(True)
             self.close_button.setVisible(True)
             return
 
@@ -219,21 +218,19 @@ class GeoFileScannerPlugin:
     def scan_folder(self, folder_path, thread=None):
         """Scanne le dossier en deux phases : comptage rapide, puis analyse si ≤ 100 couches."""
 
-        # Phase 1 : comptage sans analyse géographique
+        # Phase 1 : comptage rapide sans ouvrir les couches complètement
         if thread:
             thread.progress.emit(0, 0, "Comptage des couches en cours...")
 
-        layer_count = self._count_layers(folder_path, thread)
+        layer_count, file_count = self._count_layers(folder_path, thread)
 
         if thread and thread.is_canceled:
             return []
 
-        # Si > 100, on retourne une liste de taille > 100 pour déclencher
-        # le message d'erreur dans scan_finished sans avoir fait d'analyse
         if layer_count > 100:
             return [{}] * layer_count
 
-        # Phase 2 : analyse complète (layer_count ≤ 100)
+        # Phase 2 : analyse complète, progression basée sur le nombre de fichiers
         geo_files = []
         current = 0
 
@@ -248,51 +245,43 @@ class GeoFileScannerPlugin:
 
                 current += 1
                 if thread:
-                    thread.progress.emit(current, layer_count,
-                                         f"Analyse : {file}\n({current}/{layer_count})")
+                    thread.progress.emit(current, file_count,
+                                         f"Analyse : {file}\n({current}/{file_count})")
 
                 file_path = os.path.join(root, file)
                 geo_files.extend(self._process_file(file_path, file, file_ext, folder_path,
-                                                     thread, current, layer_count))
+                                                     thread, current, file_count))
 
         self.current_geo_files = geo_files
         compute_short_paths(geo_files, folder_path)
         return geo_files
 
     def _count_layers(self, folder_path, thread=None):
-        """Compte toutes les couches valides sans faire d'analyse géographique."""
-        count = 0
+        """Compte les couches via les métadonnées uniquement (sans instancier de couche).
+        Retourne (nb_couches, nb_fichiers_geo)."""
+        layer_count = 0
+        file_count = 0
+        metadata = QgsProviderRegistry.instance().providerMetadata('ogr')
+
         for root, _, files in os.walk(folder_path):
             for file in files:
                 if thread and thread.is_canceled:
-                    return count
+                    return layer_count, file_count
+
                 file_ext = Path(file).suffix.lower()
                 if file_ext not in self.GEO_EXTENSIONS:
                     continue
-                file_path = os.path.join(root, file)
-                if file_ext in self.MULTI_LAYER_FORMATS:
-                    count += self._count_sublayers(file_path)
-                else:
-                    layer = QgsVectorLayer(file_path, "temp", "ogr")
-                    if is_valid_geo_layer(layer):
-                        count += 1
-        return count
 
-    def _count_sublayers(self, file_path):
-        """Compte les sous-couches valides d'un fichier multi-couches."""
-        layer = QgsVectorLayer(file_path, "temp", "ogr")
-        if not layer.isValid():
-            return 0
-        metadata = QgsProviderRegistry.instance().providerMetadata('ogr')
-        if not metadata:
-            return 0
-        sublayers = metadata.querySublayers(file_path)
-        if sublayers and len(sublayers) > 1:
-            return sum(
-                1 for s in sublayers
-                if is_valid_geo_layer(QgsVectorLayer(s.uri(), "test", "ogr"))
-            )
-        return 1 if is_valid_geo_layer(layer) else 0
+                file_count += 1
+                file_path = os.path.join(root, file)
+
+                if file_ext in self.MULTI_LAYER_FORMATS and metadata:
+                    sublayers = metadata.querySublayers(file_path)
+                    layer_count += len(sublayers) if sublayers else 1
+                else:
+                    layer_count += 1
+
+        return layer_count, file_count
 
     def _process_file(self, file_path, file, file_ext, folder_path, thread, current, total):
         """Traite un fichier géographique"""

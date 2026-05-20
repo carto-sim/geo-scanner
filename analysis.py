@@ -96,9 +96,14 @@ class GeographicAnalyzer:
                 except Exception:
                     continue
 
-            # Pré-filtre par index spatial pour éviter O(n × m) tests d'intersection
+            # Utilise le centroïde pour un test point-dans-polygone, bien plus rapide
+            # qu'un test d'intersection polygone-polygone
+            centroid = geom.centroid()
+            query_geom = centroid if not centroid.isEmpty() else geom
+
+            # Pré-filtre par index spatial
             if admin_index is not None:
-                candidate_ids = admin_index.intersects(geom.boundingBox())
+                candidate_ids = admin_index.intersects(query_geom.boundingBox())
                 if not candidate_ids:
                     continue
                 admin_features = admin_layer.getFeatures(
@@ -108,7 +113,7 @@ class GeographicAnalyzer:
                 admin_features = admin_layer.getFeatures()
 
             for admin_feat in admin_features:
-                if admin_feat.hasGeometry() and admin_feat.geometry().intersects(geom):
+                if admin_feat.hasGeometry() and admin_feat.geometry().contains(query_geom):
                     fields = admin_feat.fields().names()
                     nom = admin_feat['nom'] if 'nom' in fields else None
                     code = admin_feat['code'] if 'code' in fields else None
